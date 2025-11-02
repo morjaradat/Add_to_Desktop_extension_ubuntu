@@ -1,0 +1,18 @@
+#!/bin/bash
+set -e
+
+# Restart Nautilus if it's running
+if pgrep -x "nautilus" > /dev/null; then
+    echo "Restarting Nautilus..."
+    nautilus -q 2>/dev/null || true
+fi
+
+# Reload D-Bus services
+if [ -n "$SUDO_USER" ]; then
+    su - "$SUDO_USER" -c "systemctl --user daemon-reload" 2>/dev/null || true
+fi
+
+echo "Nautilus Add to Desktop extension installed successfully!"
+echo "Please restart Nautilus or log out and back in for changes to take effect."
+
+exit 0

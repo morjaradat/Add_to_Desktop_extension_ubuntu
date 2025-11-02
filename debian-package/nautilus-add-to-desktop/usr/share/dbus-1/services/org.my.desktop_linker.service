@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.my.desktop_linker
+Exec=/usr/local/bin/add-to-desktop-service

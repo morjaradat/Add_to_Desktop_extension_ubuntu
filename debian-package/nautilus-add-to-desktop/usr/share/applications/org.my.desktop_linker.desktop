@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Desktop Linker Service
+Exec=/usr/local/bin/add-to-desktop-service
+NoDisplay=true

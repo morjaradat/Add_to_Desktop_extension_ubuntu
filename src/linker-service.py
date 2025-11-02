@@ -1,0 +1,120 @@
+import gi
+gi.require_version('Gtk', '4.0')
+from gi.repository import Gio, GLib
+import sys
+import os
+
+dbus_interface = """
+<node>
+    <interface name='org.my.desktop_linker'>
+        <method name='CreateLinks'>
+            <arg type='as' name='uris' direction='in'/>
+        </method>
+    </interface>
+</node>
+"""
+
+class LinkerService(Gio.Application):
+    def __init__(self):
+        super().__init__(application_id='org.my.desktop_linker',
+                         flags=Gio.ApplicationFlags.IS_SERVICE)
+        self.connect('activate', self.on_activate)
+        self.hold()
+        self.last_created_links = []
+
+    def on_activate(self, *args, **kwargs):
+        print("Linker service activated")
+
+    def do_dbus_register(self, connection, object_path):
+        interface_info = Gio.DBusNodeInfo.new_for_xml(dbus_interface).interfaces[0]
+        connection.register_object(object_path, interface_info, self.dbus_method_call, None, None)
+        return True
+
+    def dbus_method_call(self, connection, sender, object_path, interface_name, method_name, parameters, invocation):
+        if method_name == 'CreateLinks':
+            uris = parameters.get_child_value(0).get_strv()
+            self.create_links(uris)
+            invocation.return_value(None)
+
+    def get_desktop_dir(self):
+        return GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DESKTOP)
+
+    def create_link_for_file(self, source_file, desktop_path):
+        basename = source_file.get_basename()
+        dest_path = os.path.join(desktop_path, basename)
+        counter = 0
+
+        while True:
+            try:
+                # Use os.symlink instead of Gio
+                os.symlink(source_file.get_path(), dest_path)
+                return dest_path
+            except FileExistsError:
+                counter += 1
+                name_parts = basename.rsplit('.', 1)
+                stem = name_parts[0]
+                ext = f".{name_parts[1]}" if len(name_parts) > 1 else ""
+
+                if counter > 1:
+                    stem = stem.rsplit(' (', 1)[0]
+
+                new_name = f"{stem} ({counter}){ext}"
+                dest_path = os.path.join(desktop_path, new_name)
+            except Exception as err:
+                raise err
+
+    def create_links(self, uris):
+        desktop_dir = self.get_desktop_dir()
+        if not desktop_dir:
+            self.send_error_notification("Could not find desktop directory")
+            return
+
+        success_count = 0
+        error_count = 0
+        self.last_created_links = []
+        
+        for uri in uris:
+            try:
+                source_file = Gio.File.new_for_uri(uri)
+                result = self.create_link_for_file(source_file, desktop_dir)
+                success_count += 1
+                self.last_created_links.append(result)
+            except Exception as e:
+                error_count += 1
+                print(f"Error creating link: {e}")
+
+        if success_count > 0:
+            self.send_success_notification(success_count)
+        if error_count > 0:
+            self.send_error_notification(f"{error_count} links failed.")
+
+    def send_success_notification(self, count):
+        notification = Gio.Notification.new(f"{count} items added to Desktop")
+        notification.add_button("Undo", "app.undo")
+        self.send_notification("links-created", notification)
+
+    def send_error_notification(self, message):
+        notification = Gio.Notification.new("Error Creating Shortcuts")
+        notification.set_body(message)
+        notification.set_priority(Gio.NotificationPriority.HIGH)
+        self.send_notification("links-error", notification)
+
+    def on_undo_activate(self, action, param):
+        if not self.last_created_links:
+            return
+
+        for path in self.last_created_links:
+            try:
+                os.unlink(path)
+            except Exception as e:
+                print(f"Error deleting link {path}: {e}")
+
+        self.last_created_links = []
+        self.withdraw_notification("links-created")
+
+if __name__ == '__main__':
+    service = LinkerService()
+    action = Gio.SimpleAction.new("undo", None)
+    action.connect("activate", service.on_undo_activate)
+    service.add_action(action)
+    service.run(sys.argv)

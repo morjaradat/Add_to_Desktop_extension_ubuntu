@@ -1,0 +1,17 @@
+Package: nautilus-add-to-desktop
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, python3-nautilus, python3-gi, gir1.2-gtk-4.0
+Maintainer: morjaradat <your-email@example.com>
+Description: Add files and folders to desktop via context menu
+ This Nautilus extension adds a "Add to Desktop" option to the
+ right-click context menu, allowing users to quickly create
+ symbolic links to files and folders on their desktop.
+ .
+ Features:
+  - Right-click context menu integration
+  - Automatic name conflict handling
+  - Undo functionality
+  - Desktop notifications

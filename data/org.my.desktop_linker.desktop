@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Desktop Linker Service
+Exec=/home/mor/.local/bin/add-to-desktop-service
+NoDisplay=true

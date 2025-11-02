@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+
+# Kill the service if running
+pkill -f add-to-desktop-service 2>/dev/null || true
+
+# Restart Nautilus if it's running
+if pgrep -x "nautilus" > /dev/null; then
+    nautilus -q 2>/dev/null || true
+fi
+
+exit 0

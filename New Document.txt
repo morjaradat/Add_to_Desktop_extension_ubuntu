@@ -1,0 +1,435 @@
+
+Comprehensive Implementation Plan: Nautilus "Add to Desktop" Extension
+
+This report provides a detailed, expert-level implementation plan for a robust "Add to Desktop" extension for the GNOME Files (Nautilus) file manager. The plan is designed to satisfy complex performance, security, and user experience (UX) requirements, including full support for network shares, large directories, and "Undo" functionality.
+The analysis concludes that a simple, single-file script is insufficient to meet these requirements. A stable and high-performance solution necessitates a two-part, decoupled architecture:
+Part A: The nautilus-python Extension (Frontend): A lightweight Python script that integrates with the Nautilus context menu. Its sole responsibility is to capture the user's click and dispatch a request to a background service via D-Bus, ensuring the file manager's UI never blocks or freezes.
+Part B: The D-Bus Background Service (Backend): A persistent, D-Bus-activatable Gio.Application service. This backend performs all I/O operations asynchronously, handles file-linking logic, manages all error states, and sends rich notifications (including the "Undo" action) back to the user.
+This architecture is the optimal solution for balancing UI responsiveness with complex, potentially long-running file operations.
+
+Part 1: Foundational Architecture: The nautilus-python Extension (Frontend)
+
+This component serves as the non-blocking user interface integration point within Nautilus.
+
+1.1 Core Framework Selection
+
+The primary integration will be achieved using nautilus-python.1 This is the officially supported framework for GObject-based extensions in Nautilus.
+Technology Choice: The nautilus-python bindings provide the necessary Nautilus.MenuProvider interface.3 This allows for the creation of a Python class inheriting from GObject.GObject and Nautilus.MenuProvider to inject menu items.3
+Rejected Alternatives:
+nautilus-scripts: This method is rejected as it places all actions within a "Scripts" submenu.6 This adds friction and does not meet the requirement for a top-level "Add to Desktop" menu item.
+actions-for-nautilus / nautilus-actions: These are third-party extensions or deprecated tools.9 Relying on nautilus-python ensures native integration without external dependencies.
+Installation: The extension file (e.g., add-to-desktop.py) will be installed to ~/.local/share/nautilus-python/extensions/ for a per-user installation or /usr/share/nautilus-python/extensions/ for a system-wide one.4
+
+1.2 GNOME 45+ API Compatibility
+
+A critical consideration is the API migration that occurred with Nautilus 43+ (affecting GNOME 45, 46, and newer).13
+API Change: The get_file_items and get_background_items methods of Nautilus.MenuProvider no longer receive the window argument.13 Older examples showing a (self, window, files) signature are deprecated and will fail to load.
+Architectural Implication: This change was deliberate, moving Nautilus to a model-based UI and preventing extensions from directly manipulating GTK widgets.13 This removes the ability to attach UI elements like a Gtk.InfoBar for progress. This API change mandates the decoupled architecture, as all user feedback (progress, errors, undo) must now be handled out-of-process via standard Gio.Notifications.
+Implementation: The method signature must be def get_file_items(self, files: List[Nautilus.FileInfo]).
+
+1.3 Implementing get_file_items: The Non-Blocking Menu
+
+This method is executed every time a user right-clicks in Nautilus. It must be synchronous and return immediately to prevent UI lag.
+Performance Optimization: The "Large Directories" 14 and "Network Latency" 16 edge cases are solved here by deferring all I/O. The get_file_items method will perform zero file operations. It is explicitly warned that blocking operations in this method will freeze Nautilus.17
+Logic: This method will only perform the following:
+Check if not files: return. This prevents the item from appearing on a background click.
+Instantiate the Nautilus.MenuItem.
+Set the label (e.g., _("Add to Desktop") or _("Add %d Items to Desktop") % len(files)) using gettext for internationalization.18
+Connect the menu item's activate signal to a callback, self.on_activate.5
+Return the menu item.
+Accessibility: The tip argument for Nautilus.MenuItem 5 is ignored in modern Nautilus.20 Accessibility will be provided by the descriptive, translated label and Nautilus's native keyboard navigation support for context menus.21
+
+1.4 The on_activate D-Bus Handler
+
+This callback function is triggered when the user clicks the menu item. It runs in the Nautilus main thread and must also be non-blocking.
+Logic: This function's sole purpose is to dispatch the work to the background service.
+Implementation:
+It receives the files: List[Nautilus.FileInfo] from the signal connection.5
+It constructs a list of file URIs: uris = [f.get_uri() for f in files].
+It connects to the session D-Bus.22
+It makes an asynchronous, non-blocking call to the background service's D-Bus method (e.g., org.my.desktop_linker.CreateLinks(uris)).23
+The function returns immediately. The Nautilus UI is now unblocked, and all further work, error handling, and notification is the responsibility of the background service.
+
+Part 2: Core File Operation: The Background Service (Backend)
+
+This service is a standalone Python script, implemented as a Gio.Application, that handles all logic.
+
+2.1 Strategic Choice: Symbolic Links over .desktop Files
+
+The requirement is to create "working shortcuts on desktop for any file type."
+Analysis:
+.desktop files: These files are the standard for applications.25 The Type=Link and URL=file:///... specification is brittle and not universally supported for arbitrary files.28 Using Exec=xdg-open /path/to/file 28 is a workaround, not a transparent shortcut.
+Symbolic Links: Creating a symbolic link (ln -s) is the correct, robust, and filesystem-level solution.29 A symlink is transparent to the OS and all applications (GUI or terminal).31 This is the only method that fully satisfies the requirement.
+
+2.2 Implementation with GIO (Gnome Input/Output)
+
+The choice of I/O library in the backend is critical for handling network-related edge cases.
+GIO over os Module: The backend must use the Gio.File API 33 and not the standard Python os module (e.g., os.symlink 34).
+GVFS Support: The URIs received from Nautilus may not be local (file:///...). They could be smb://..., ftp://..., or any other GNOME Virtual File System (GVFS) mount. Python's os module cannot operate on these non-local paths.
+Solution: Gio.File is the GObject abstraction that understands GVFS.35 Using Gio.File.new_for_uri(uri) to get the source file and Gio.File.make_symbolic_link_async(destination,...) 36 to create the link will work transparently for both local and remote files, correctly handling the "Network Latency" edge case.
+
+Part 3: Solution Engineering: Filesystem Edge Cases
+
+The background service will be engineered to robustly handle all filesystem edge cases.
+
+3.1 Locating the Desktop Directory
+
+Hardcoding ~/Desktop will fail. The path must be queried dynamically.
+Solution: The service will use GLib.get_user_special_dir(GLib.UserDirectory.G_USER_DIRECTORY_DESKTOP).37 This function respects the user's XDG configuration 40 and locale (e.g., ~/Schreibtisch, ~/Escritorio).
+Edge Case ("Missing/Disabled Desktop"): GLib.get_user_special_dir will return None if the desktop directory is not configured.41 The service must check for this: if desktop_path is None:. If None, the service will abort the operation and send a clear error notification (see Part 5.1).
+
+3.2 Handling Permissions (EAFP Strategy)
+
+This covers read-only source files, protected destinations, and network share permissions.
+Strategy (EAFP): The service will not pre-check permissions. Checking first (e.g., os.access 42 or Gio.File.query_info('access::can-write') 43) creates a "Time-of-check to time-of-use" (TOCTOU) race condition.42 GIO documentation explicitly warns against this "check-then-do" anti-pattern.36
+Implementation: The service will adopt the "Easier to Ask Forgiveness than Permission" (EAFP) principle. It will try to create the link. If the asynchronous operation fails, it will except the GLib.Error and inspect its specific domain and code.46
+Error Handling:
+Python
+from gi.repository import GLib, Gio
+try:
+    # Awaiting the async GIO function
+    await source_file.make_symbolic_link_async(dest_file, None)
+except GLib.Error as err:
+    if err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.PERMISSION_DENIED):
+        # Handle permission error 
+        send_error_notification("Permission Denied", f"Could not link {source_file.get_basename()}")
+    elif err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.EXISTS):
+        # Pass to name conflict handler (see 3.3)
+        pass 
+    else:
+        # Handle other errors (disk full, network down, etc.)
+        send_error_notification("Operation Failed", err.message)
+
+
+Security Policies: This identical try...except block will also catch permission failures from security subsystems like SELinux 47 or Flatpak portals 49, which manifest to GIO as Gio.IOErrorEnum.PERMISSION_DENIED.
+
+3.3 Handling Name Conflicts (Race-Free Renaming)
+
+This handles the case where file.pdf already exists on the desktop.
+Strategy (Atomic Loop): A "check-then-create" approach is racy. The service must use an atomic "try-and-increment" loop.36
+Implementation: This logic will be encapsulated in an async function that is called for each file.
+Python
+async def create_link_task(self, source_file, desktop_path):
+    basename = source_file.get_basename()
+    # GLib.build_filenamev handles path separators [33, 51]
+    dest_file = Gio.File.new_for_path(GLib.build_filenamev([desktop_path, basename]))
+    counter = 0
+
+    while True:
+        try:
+            # Attempt to create the link
+            await dest_file.make_symbolic_link_async(source_file, None)
+            return dest_file.get_path() # Success: return path for Undo
+        except GLib.Error as err:
+            if err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.EXISTS):
+                # File exists; increment and retry [45, 52]
+                counter += 1
+                name_parts = basename.rsplit('.', 1)
+                stem = name_parts
+                ext = f".{name_parts}" if len(name_parts) > 1 else ""
+
+                # Handle "file (1).txt" -> "file (2).txt"
+                if counter > 1:
+                    stem = stem.rsplit(' (', 1)
+
+                new_name = f"{stem} ({counter}){ext}"
+                dest_file = Gio.File.new_for_path(GLib.build_filenamev([desktop_path, new_name]))
+            else:
+                # A real error (e.g., permissions); re-raise to be caught
+                raise err
+
+
+
+3.4 Handling Complex Paths and File Types
+
+Unicode/Special Characters: Solved. Gio.File 53 and GLib.build_filenamev 33 are fully Unicode- and platform-aware.
+Hidden Files: Solved. Nautilus.FileInfo objects for hidden files (e.g., .bashrc) are passed to the extension. The logic in 3.3 will create a hidden symlink on the desktop (e.g., .bashrc), which is the correct and expected behavior.
+Broken/Circular Symlinks: This is a non-issue. The user is right-clicking on the symlink object itself. The service creates a new symlink that points to the path of the selected item (which happens to be a symlink). It does not resolve the target.54 The operating system will handle the nested-link resolution when the user clicks the new shortcut. This is the simplest and most robust approach.
+
+Part 4: Solution Engineering: Performance and Concurrency
+
+The architecture is designed to handle high-load scenarios without impacting system responsiveness.
+
+4.1 Large Directories (UI Freeze)
+
+This edge case is fully resolved by the frontend architecture (Part 1.3). The nautilus-python extension performs zero I/O in the get_file_items method.17 The Nautilus UI will remain responsive even in directories with millions of files 14, as all work is deferred.
+
+4.2 Network Latency (Remote Files)
+
+This edge case is fully resolved by the backend architecture (Part 2.2). The background service uses asynchronous GIO methods (..._async).36 GIO's gvfs integration handles the non-blocking I/O over the network.16 A high-latency file operation will pend in the background event loop without freezing the service or the user's desktop.
+
+4.3 Concurrent Operations (Multiple Files)
+
+This handles the "Multiple Selection" and "Concurrent Operations" edge cases, where a user selects thousands of files.
+Strategy (Parallelism): A simple for loop, even an async one, would process files sequentially. The operations must be parallelized.
+Implementation: The D-Bus service will leverage PyGObject's asyncio integration.56
+The service will set the GLibEventLoopPolicy for asyncio.
+When its D-Bus method is called, it will create a list of create_link_task coroutines (from 3.3), one for each selected file.
+It will then execute all tasks in parallel using await asyncio.gather(*tasks, return_exceptions=True).56
+After all parallel tasks complete, the service will process the results list, separating successful created_paths from errors. This list is then used to send a single summary notification.
+
+Part 5: Solution Engineering: User Experience and Security
+
+All user feedback is managed by the background D-Bus service.
+
+5.1 Error Handling and User Feedback
+
+Correct Notification API: The service must use Gio.Application.send_notification.58 It must not attempt to use GJS APIs like Main.notify 61, which are part of the GNOME Shell process and inaccessible from a nautilus-python extension or its related service.
+Logic: After asyncio.gather (from 4.3) completes, the service will check the results.
+If errors exist, it will send a high-priority notification:
+notification = Gio.Notification.new(_("Error Creating Shortcuts"))
+notification.set_body(_("%d links failed. See log for details.") % len(errors))
+notification.set_priority(Gio.NotificationPriority.HIGH) 63
+self.send_notification("links-error", notification)
+
+5.2 Advanced UX: "Undo" Functionality
+
+This feature is the primary driver for the entire two-part D-Bus architecture. It requires a stateful background service.
+Implementation:
+Gio.Application Setup: The background service must be a Gio.Application 58 and must be accompanied by a .desktop file. This .desktop file is required for D-Bus activation and, critically, to serve as the identity for notification actions.58
+Register Action: The service will register a Gio.SimpleAction for the "undo" command:
+Python
+action = Gio.SimpleAction.new("undo", None)
+action.connect("activate", self.on_undo_activate)
+self.add_action(action) 
+# This action is now callable via D-Bus as "app.undo" [64]
+
+
+Store State & Send Notification: After a successful asyncio.gather (from 4.3), the service stores the state and sends the "Undo" notification:
+Python
+self.last_created_links = created_paths # Store list of new link paths
+notification_id = "links-created"
+title = _("%d items added to Desktop") % len(created_paths)
+notification = Gio.Notification.new(title)
+
+# Add the button that triggers the "app.undo" action [65, 66]
+notification.add_button(_("Undo"), "app.undo") 
+
+# Send the actionable notification [60]
+self.send_notification(notification_id, notification)
+
+
+Handle "Undo" Action: The on_undo_activate callback will fire when the user clicks the "Undo" button:
+Python
+def on_undo_activate(self, action, param):
+    if not self.last_created_links: return
+
+    # Spawn parallel tasks to delete all the links
+    tasks =
+    for path in self.last_created_links:
+        file_to_delete = Gio.File.new_for_path(path)
+        tasks.append(file_to_delete.delete_async(None))
+
+    #... (await asyncio.gather(tasks)...)
+
+    self.last_created_links = # Clear the state
+
+    # Remove the notification [67]
+    self.withdraw_notification("links-created")
+
+
+
+5.3 Internationalization (i18n)
+
+All user-facing strings in both the frontend extension and the backend service (labels, notification titles, error messages) will be wrapped for translation using Python's standard gettext module.19 This involves generating .pot (template), .po (translation), and .mo (compiled) files as part of the build process.70
+
+5.4 Security Policies (Flatpak/SELinux)
+
+Flatpak: The nautilus-python extension (Part A) runs inside the Nautilus sandbox.49 The D-Bus call creates a clean security boundary. The background service (Part B), running as a normal user process, will use GIO's transparent support for XDG portals.71 It can read the sandboxed file URIs via the file-chooser portal and write the new links to ~/Desktop via the xdg-desktop file access permission.73
+SELinux: As detailed in 3.2, SELinux denials will be caught by the EAFP block as a Gio.IOErrorEnum.PERMISSION_DENIED.47 The service will not attempt to parse audit logs; it will simply report the "Permission Denied" error to the user via notification.
+
+Part 6: Packaging and Distribution
+
+This two-part architecture requires a formal package, not just a single .py file. The installer (e.g., setup.py, Makefile) must handle five components:
+add-to-desktop.py: The nautilus-python extension script.
+Destination: /usr/share/nautilus-python/extensions/.12
+linker-service.py: The Python script for the background D-Bus service.
+Destination: /usr/libexec/ (or /usr/bin/).
+org.my.desktop_linker.desktop: The .desktop file for the Gio.Application.
+Destination: /usr/share/applications/.74
+Purpose: Required by Gio.Application for D-Bus activation and as the identity for notifications.59
+org.my.desktop_linker.service: The D-Bus service file.
+Destination: /usr/share/dbus-services/.
+Purpose: Tells D-Bus to launch the .desktop file (which in turn runs linker-service.py) when the name org.my.desktop_linker is requested.23
+Locale Files: The compiled .mo files for i18n.
+Destination: /usr/share/locale/
+The package must also declare a dependency on python-nautilus.76
+
+Edge Case Resolution Matrix
+
+The following table summarizes the optimized solution for each identified edge case.
+
+Edge Case Category
+Specific Edge Case
+Optimized Solution / API
+Source(s)
+Filesystem
+Permission Issues (Read-only)
+EAFP: try...except GLib.Error on Gio.IOErrorEnum.PERMISSION_DENIED
+[35, 46]
+
+
+Path Complexity (Unicode, special)
+Gio.File.new_for_path() and GLib.build_filenamev
+[33, 53]
+
+
+File Types (Executables, hidden)
+Gio.File.new_for_uri() handles all types.
+[33, 77]
+
+
+Broken/Circular Symlinks
+No-op: We link to the path of the symlink, not its resolved target.
+[34, 55]
+
+
+Multiple Selection
+asyncio.gather on List[Nautilus.FileInfo] in background service.
+[18, 56]
+Desktop Env.
+Desktop Folder Variations
+GLib.get_user_special_dir(GLib.UserDirectory.G_USER_DIRECTORY_DESKTOP)
+[37, 39]
+
+
+Name Conflicts (Duplicates)
+Atomic Loop: try...except on Gio.IOErrorEnum.EXISTS and increment (1).
+36
+GNOME/System
+GNOME Version (45+)
+Use nautilus-python 4.0+ API: get_file_items(self, files) (no window).
+13
+
+
+Display Server (Wayland/X11)
+N/A: Gio and D-Bus are display-server-agnostic.
+
+
+
+
+Security (Flatpak)
+Gio.File operations will transparently use xdg-desktop-portal.
+[71, 73]
+
+
+Security (SELinux)
+Gio.IOErrorEnum.PERMISSION_DENIED (handled in permissions).
+47
+Performance
+Large Directories (UI Freeze)
+Zero I/O in get_file_items. Defer all work to background service.
+[14, 17]
+
+
+Network Latency (Remote Files)
+_async GIO methods (e.g., make_symbolic_link_async) in background service.
+[16, 36]
+
+
+Concurrent Operations
+asyncio.gather to run all link creations in parallel.
+56
+User Experience
+Error Handling (Feedback)
+Gio.Application.send_notification from background D-Bus service.
+[58, 60]
+
+
+Progress Indication
+Deferred: Symlinking is near-instant. True progress is not required.
+[78, 79]
+
+
+Undo Functionality
+Gio.Application D-Bus service + Gio.Notification with "app.undo" action.
+[64, 65]
+
+
+Internationalization (i18n)
+Python gettext module for all user-facing strings.
+[19, 70]
+
+
+Accessibility (a11y)
+Descriptive label on Nautilus.MenuItem. tip is not supported.
+[20, 21]
+
+
+Conclusion and Recommendation
+
+This implementation plan outlines a comprehensive and robust solution. A simplistic approach (e.g., a single script performing synchronous I/O) would inevitably fail, leading to a frozen UI, poor error handling, and an inability to support network mounts or "Undo" functionality.
+The two-part architecture, centered on a non-blocking nautilus-python frontend and an asynchronous Gio.Application backend, is the definitive method. It correctly leverages GIO, D-Bus, and asyncio to solve every identified edge case, from UI performance in large network directories to the complex state management required for an "Undo" button. This design ensures the final extension will be responsive, stable, and fully integrated into the modern GNOME desktop environment.
+Works cited
+nautilus-python Reference Manual, accessed November 2, 2025, https://gnome.pages.gitlab.gnome.org/nautilus-python
+nautilus-python - GitLab - GNOME, accessed November 2, 2025, https://gitlab.gnome.org/GNOME/nautilus-python
+A Simple Extension: nautilus-python Reference Manual, accessed November 2, 2025, https://gnome.pages.gitlab.gnome.org/nautilus-python/nautilus-python-overview-example.html
+Extending Nautilus Context Menus using Nautilus Actions, Scripts and Python Extensions, accessed November 2, 2025, https://saravananthirumuruganathan.wordpress.com/2010/08/29/extending-nautilus-context-menus-using-nautilus-actions-scripts-and-python-extensions/
+How to edit the context menus of Nautilus File Manager? - Ask Ubuntu, accessed November 2, 2025, https://askubuntu.com/questions/414436/how-to-edit-the-context-menus-of-nautilus-file-manager
+Add a custom option in Nautilus right click menu [closed] - Stack Overflow, accessed November 2, 2025, https://stackoverflow.com/questions/47235022/add-a-custom-option-in-nautilus-right-click-menu
+How can you add an item to the right-click menu in nautilus (without Nautilus-Actions)?, accessed November 2, 2025, https://askubuntu.com/questions/210192/how-can-you-add-an-item-to-the-right-click-menu-in-nautilus-without-nautilus-ac
+How can I write Nautilus scripts in Python? - Ask Ubuntu, accessed November 2, 2025, https://askubuntu.com/questions/14700/how-can-i-write-nautilus-scripts-in-python
+bassmanitram/actions-for-nautilus: An extension to the Gnome "Files" file manager that allows you to add arbitrary actions to the file selection context menu. - GitHub, accessed November 2, 2025, https://github.com/bassmanitram/actions-for-nautilus
+Is it possible to add an item to the Nautilus right click menu in CentOS?, accessed November 2, 2025, https://unix.stackexchange.com/questions/91876/is-it-possible-to-add-an-item-to-the-nautilus-right-click-menu-in-centos
+Adding Your Own Context Menu Entries to GNOME Files (Nautilus) - Victor's Blog, accessed November 2, 2025, https://blog.victor.co.zm/custom-nautilus-context-menu-python-extension
+Is it possible to get the directory of a specific nautilus window in a script? - Stack Overflow, accessed November 2, 2025, https://stackoverflow.com/questions/51070465/is-it-possible-to-get-the-directory-of-a-specific-nautilus-window-in-a-script
+Migrating to Nautilus API 4.0: nautilus-python Reference Manual, accessed November 2, 2025, https://gnome.pages.gitlab.gnome.org/nautilus-python/nautilus-python-migrating-to-4.html
+Significant Performance Discrepancy Between Nautilus and Terminal Tools (du/find) When Calculating Folder Size and Item Count - GNOME Discourse, accessed November 2, 2025, https://discourse.gnome.org/t/significant-performance-discrepancy-between-nautilus-and-terminal-tools-du-find-when-calculating-folder-size-and-item-count/26177
+Nautilus so slow, if there are so many files/folder in an opened directory - Ask Ubuntu, accessed November 2, 2025, https://askubuntu.com/questions/892549/nautilus-so-slow-if-there-are-so-many-files-folder-in-an-opened-directory
+Initial load of folders with many items is too slow on HDDs and remote FUSE filesystems (#3374) · Issue · GNOME/nautilus, accessed November 2, 2025, https://gitlab.gnome.org/GNOME/nautilus/-/issues/3374
+Integrate application in GTK+2 with Nautilus 3 (using GTK+3). Is this possible?, accessed November 2, 2025, https://stackoverflow.com/questions/11497911/integrate-application-in-gtk2-with-nautilus-3-using-gtk3-is-this-possible
+Bulk rename for Nautilus, with a text editor / Community Contributions / Arch Linux Forums, accessed November 2, 2025, https://bbs.archlinux.org/viewtopic.php?id=210104
+gettext — Multilingual internationalization services — Python 3.14.0 documentation, accessed November 2, 2025, https://docs.python.org/3/library/gettext.html
+icon and tip in Nautilus.MenuItem are ignored (#7) · Issue - GitLab - GNOME, accessed November 2, 2025, https://gitlab.gnome.org/GNOME/nautilus-python/-/issues/7
+Keyboard navigation, accessed November 2, 2025, https://help.gnome.org/users/gnome-help/stable/keyboard-nav.html.en
+DbusExamples - Python Wiki, accessed November 2, 2025, https://wiki.python.org/moin/DbusExamples
+bulletmark/dbus-action: Watch D-Bus to action configured commands on specific events - GitHub, accessed November 2, 2025, https://github.com/bulletmark/dbus-action
+Writing D-Bus Services in Python and Twisted - DEV Community, accessed November 2, 2025, https://dev.to/jfhbrook/writing-d-bus-services-in-python-and-twisted-1l60
+Freedesktop.org Specifications, accessed November 2, 2025, https://specifications.freedesktop.org/
+Desktop Entry Specification, accessed November 2, 2025, https://specifications.freedesktop.org/desktop-entry-spec/desktop-entry-spec-latest.html
+desktop-entry-spec - Freedesktop.org, accessed November 2, 2025, https://www.freedesktop.org/wiki/Specifications/desktop-entry-spec/
+How to add shortcut/starter (to file, program. or folder) in the desktop or menu bar of Ubuntu 18.04?, accessed November 2, 2025, https://askubuntu.com/questions/1197990/how-to-add-shortcut-starter-to-file-program-or-folder-in-the-desktop-or-menu
+How to make a desktop shortcut on Ubuntu 20.04?, accessed November 2, 2025, https://askubuntu.com/questions/1232612/how-to-make-a-desktop-shortcut-on-ubuntu-20-04
+What is the difference between Symbolic Link and Shortcut? - Super User, accessed November 2, 2025, https://superuser.com/questions/253935/what-is-the-difference-between-symbolic-link-and-shortcut
+Difference between symbolic links and shortcuts - Stack Overflow, accessed November 2, 2025, https://stackoverflow.com/questions/38293372/difference-between-symbolic-links-and-shortcuts
+Someone please explain symlinks to me. I know "conceptually" what they are, but are they IDENTICAL to shortcuts in Windows? How does one make them? Can you make them with file manager or does it have to be command line? : r/linux - Reddit, accessed November 2, 2025, https://www.reddit.com/r/linux/comments/1a3xxq/someone_please_explain_symlinks_to_me_i_know/
+File Operations - GNOME JavaScript, accessed November 2, 2025, https://gjs.guide/guides/gio/file-operations.html
+Python os.symlink() method - GeeksforGeeks, accessed November 2, 2025, https://www.geeksforgeeks.org/python/python-os-symlink-method/
+Asynchronously Read Files in Python with Gio - Micah Carrick, accessed November 2, 2025, https://www.micahcarrick.com/asynchronous-read-in-python-with-gio.html
+Gio.File - Interfaces - Gio 2.0, accessed November 2, 2025, https://lazka.github.io/pgi-docs/Gio-2.0/interfaces/File.html
+GLib.get_user_special_dir - WebReflection, accessed November 2, 2025, http://webreflection.github.io/gjs-documentation/GLib-2.0/GLib.get_user_special_dir.html
+GLib.UserDirectory - GTK Documentation, accessed November 2, 2025, https://docs.gtk.org/glib/enum.UserDirectory.html
+How can I get the (XDG) Default User Directories from Python? - Ask Ubuntu, accessed November 2, 2025, https://askubuntu.com/questions/457047/how-can-i-get-the-xdg-default-user-directories-from-python
+XDG user directories - ArchWiki, accessed November 2, 2025, https://wiki.archlinux.org/title/XDG_user_directories
+GLib.get_user_special_dir, accessed November 2, 2025, https://docs.gtk.org/glib/func.get_user_special_dir.html
+Check the permissions of a file in python - Stack Overflow, accessed November 2, 2025, https://stackoverflow.com/questions/27434643/check-the-permissions-of-a-file-in-python
+Gio.FILE_ATTRIBUTE_ACCESS_CAN_READ, accessed November 2, 2025, https://docs.gtk.org/gio/const.FILE_ATTRIBUTE_ACCESS_CAN_READ.html
+GFileAttribute, accessed November 2, 2025, https://stuff.mit.edu/afs/sipb/project/barnowl/share/gtk-doc/html/gio/gio-GFileAttribute.html
+Gio.File.query_exists, accessed November 2, 2025, https://docs.gtk.org/gio/method.File.query_exists.html
+Error Handling - GLib - PyGObject, accessed November 2, 2025, https://pygobject.gnome.org/guide/api/error_handling.html
+SELinux influences "failed to open stream: Permission denied” PHP error - Stack Overflow, accessed November 2, 2025, https://stackoverflow.com/questions/27501349/selinux-influences-failed-to-open-stream-permission-denied-php-error
+SELinux Permission Denied Python3.3 CentOS 6.5 - Stack Overflow, accessed November 2, 2025, https://stackoverflow.com/questions/28597857/selinux-permission-denied-python3-3-centos-6-5
+How to use Python extensions when using org.gnome.Nautilus.Devel (beta version)?, accessed November 2, 2025, https://discourse.gnome.org/t/how-to-use-python-extensions-when-using-org-gnome-nautilus-devel-beta-version/31639
+Accessing External storage from Flatpak apps · Issue #2713 - GitHub, accessed November 2, 2025, https://github.com/flatpak/flatpak/issues/2713
+Character Set Conversions - GLib – 2.0 - GTK Documentation, accessed November 2, 2025, https://docs.gtk.org/glib/character-set.html
+Pathlib.is_dir() handling of recursive symlinks is arguably wrong · Issue #101542 · python/cpython - GitHub, accessed November 2, 2025, https://github.com/python/cpython/issues/101542
+Gio.FileInfo.get_is_symlink, accessed November 2, 2025, https://docs.gtk.org/gio/method.FileInfo.get_is_symlink.html
+Asynchronous Programming with asyncio - PyGObject - GNOME, accessed November 2, 2025, https://pygobject.gnome.org/guide/asynchronous.html
+asyncio only processes one file at a time - Stack Overflow, accessed November 2, 2025, https://stackoverflow.com/questions/73159637/asyncio-only-processes-one-file-at-a-time
+Notification - GNOME Python API, accessed November 2, 2025, https://api.pygobject.gnome.org/Gio-2.0/class-Notification.html
+Gio.Notification, accessed November 2, 2025, https://docs.gtk.org/gio/class.Notification.html
+Gio.Application.send_notification, accessed November 2, 2025, https://docs.gtk.org/gio/method.Application.send_notification.html
+Notifications - GNOME JavaScript, accessed November 2, 2025, https://gjs.guide/extensions/topics/notifications.html
+Set Notification Icon in Gnome Shell >= 3.16 (Custom Extension) - Stack Overflow, accessed November 2, 2025, https://stackoverflow.com/questions/32923811/set-notification-icon-in-gnome-shell-3-16-custom-extension
+Why is Gio.Notification not showing in Python? - Stack Overflow, accessed November 2, 2025, https://stackoverflow.com/questions/69154975/why-is-gio-notification-not-showing-in-python
+24. Application — Python GTK+ 3 Tutorial 3.4 documentation, accessed November 2, 2025, https://python-gtk-3-tutorial.readthedocs.io/en/latest/application.html
+gettext | Python Standard Library, accessed November 2, 2025, https://realpython.com/ref/stdlib/gettext/
+How to Translate Python Applications with the GNU gettext Module - Phrase, accessed November 2, 2025, https://phrase.com/blog/posts/translate-python-gnu-gettext/
+How to Use Gettext for App Translation & Python i18n | Lokalise Integration - YouTube, accessed November 2, 2025, https://www.youtube.com/watch?v=_pDZzE6Yvn4
+XDG Desktop Portal - Flatpak, accessed November 2, 2025, https://flatpak.github.io/xdg-desktop-portal/
+How can I tell when an app is using portals for file dialogs ? : r/flatpak - Reddit, accessed November 2, 2025, https://www.reddit.com/r/flatpak/comments/113wtzs/how_can_i_tell_when_an_app_is_using_portals_for/
+Sandbox Permissions - Flatpak documentation, accessed November 2, 2025, https://docs.flatpak.org/en/latest/sandbox-permissions.html
+Custom .desktop file not showing in Nautilus "Open With" menu - Super User, accessed November 2, 2025, https://superuser.com/questions/654165/custom-desktop-file-not-showing-in-nautilus-open-with-menu
+How do I create a desktop entry to launch a Python script? - Ask Ubuntu, accessed November 2, 2025, https://askubuntu.com/questions/342950/how-do-i-create-a-desktop-entry-to-launch-a-python-script
+To make or not to make...python-nautilus a dependency? - Ask Ubuntu, accessed November 2, 2025, https://askubuntu.com/questions/160070/to-make-or-not-to-make-python-nautilus-a-dependency
+

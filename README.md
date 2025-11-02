@@ -18,8 +18,8 @@ A Nautilus extension that adds a convenient "Add to Desktop" option to the right
 **Easy Installation - Just double-click the .deb file or use:**
 
 ```bash
-# Download the package (replace with actual download URL)
-wget https://github.com/yourusername/nautilus-add-to-desktop/releases/download/v1.0.0/nautilus-add-to-desktop_1.0.0_all.deb
+# Download the package
+wget https://github.com/morjaradat/Add_to_Desktop_extension_ubuntu/releases/download/v1.0.0/nautilus-add-to-desktop_1.0.0_all.deb
 
 # Install with automatic dependency resolution
 sudo apt install ./nautilus-add-to-desktop_1.0.0_all.deb
@@ -43,8 +43,8 @@ The package will automatically:
 **For developers or advanced users:**
 
 ```bash
-git clone https://github.com/yourusername/nautilus-add-to-desktop.git
-cd nautilus-add-to-desktop
+git clone https://github.com/morjaradat/Add_to_Desktop_extension_ubuntu.git
+cd Add_to_Desktop_extension_ubuntu
 
 # Method A: Using Make (Recommended)
 make install
@@ -65,7 +65,7 @@ chmod +x install.sh
 
 ## Screenshot
 
-![Context Menu](screenshot.png)
+![Nautilus Add to Desktop context menu](screenshot.png)
 *Right-click context menu showing "Add to Desktop" option*
 
 ## Uninstallation
@@ -137,6 +137,14 @@ mv debian-package/nautilus-add-to-desktop.deb ./nautilus-add-to-desktop_1.0.0_al
 ## License
 
 MIT License - feel free to use, modify, and distribute!
+
+## 📦 Download
+
+- **License:** MIT
+- **Latest Release:** [v1.0.0](https://github.com/morjaradat/Add_to_Desktop_extension_ubuntu/releases/tag/v1.0.0)
+- **Direct Download:** [nautilus-add-to-desktop_1.0.0_all.deb](https://github.com/morjaradat/Add_to_Desktop_extension_ubuntu/releases/download/v1.0.0/nautilus-add-to-desktop_1.0.0_all.deb)
+- **File Size:** 3.1 KB
+- **Release Date:** 2025-11-02
 
 ## Changelog
 
